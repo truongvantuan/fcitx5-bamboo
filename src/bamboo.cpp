@@ -395,6 +395,11 @@ std::string BambooEngine::subMode(const fcitx::InputMethodEntry & /*entry*/,
     return *config_.inputMethod;
 }
 
+std::string BambooEngine::subModeLabelImpl(const fcitx::InputMethodEntry & /*entry*/,
+                                           fcitx::InputContext & /*inputContext*/) {
+    return "vi";
+}
+
 void BambooEngine::activate(const InputMethodEntry &entry,
                             InputContextEvent &event) {
     FCITX_UNUSED(entry);

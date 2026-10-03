@@ -66,7 +66,7 @@ private:
 
 class BambooState;
 
-class BambooEngine final : public InputMethodEngine {
+class BambooEngine final : public InputMethodEngineV2 {
 public:
     BambooEngine(Instance *instance);
 
@@ -92,6 +92,9 @@ public:
                       const RawConfig &config) override;
     std::string subMode(const fcitx::InputMethodEntry &entry,
                         fcitx::InputContext &inputContext) override;
+
+    std::string subModeLabelImpl(const fcitx::InputMethodEntry &entry,
+                                 fcitx::InputContext &inputContext) override;
 
     uintptr_t dictionary() { return dictionary_.handle(); }
     uintptr_t macroTable() {
