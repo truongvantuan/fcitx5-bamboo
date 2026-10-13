@@ -10,10 +10,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <fcitx-config/iniparser.h>
 #include <fcitx-config/rawconfig.h>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/charutils.h>
+#include <fcitx-utils/event.h>
 #include <fcitx-utils/i18n.h>
 #include <fcitx-utils/keysym.h>
 #include <fcitx-utils/log.h>
@@ -43,6 +45,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#ifdef __linux__
+#include <linux/input-event-codes.h>
+#endif
 
 namespace fcitx {
 
@@ -52,6 +57,15 @@ constexpr std::string_view MacroPrefix = "macro/";
 constexpr std::string_view InputMethodActionPrefix = "bamboo-input-method-";
 constexpr std::string_view CharsetActionPrefix = "bamboo-charset-";
 const std::string CustomKeymapFile = "conf/bamboo-custom-keymap.conf";
+
+#ifdef __linux__
+// Fcitx keys use XKB codes; GNOME converts them back to evdev codes before
+// sending keyboard events to Wayland clients. A keysym with code 0 becomes
+// KEY_RESERVED, so those clients cannot apply the Backspace replacement.
+constexpr int BackspaceKeyCode = KEY_BACKSPACE + 8;
+#else
+constexpr int BackspaceKeyCode = 0;
+#endif
 
 FCITX_DEFINE_LOG_CATEGORY(bamboo, "bamboo");
 
@@ -95,6 +109,8 @@ public:
     ~BambooState() {}
 
     void setEngine() {
+        flushPendingInput();
+        resetDirectTracking();
         bambooEngine_.reset();
 
         if (*engine_->config().inputMethod == "Custom") {
@@ -135,6 +151,13 @@ public:
     }
 
     void keyEvent(KeyEvent &keyEvent) {
+        if (waitingForCommit_) {
+            // Preserve subsequent presses, releases, and navigation keys while
+            // the client finishes the Backspaces for this replacement.
+            pendingKeys_.push_back(keyEvent);
+            keyEvent.filterAndAccept();
+            return;
+        }
         if (!bambooEngine_) {
             return;
         }
@@ -147,10 +170,36 @@ public:
             return;
         }
 
+        if (directInput() && !directText_.empty() && !directTextMatches()) {
+            if (isStaleZenSurrounding()) {
+                // Keep the word when Zen echoes a state before our recent
+                // commits. Only this field needs the native-key fallback.
+                directBackspaceFallback_ = true;
+                directCursor_.reset();
+                directSurroundingHistory_.clear();
+            } else {
+                // The application moved the cursor, selected text, or edited
+                // the word. Never replace text outside our current buffer.
+                ResetEngine(bambooEngine_.handle());
+                resetDirectTracking();
+            }
+        }
+
         if (keyEvent.key().checkKeyList(*engine_->config().restoreKeyStroke)) {
             EngineSetRestoreKeyStroke(bambooEngine_.handle());
             keyEvent.filterAndAccept();
             return;
+        }
+
+        if (directInput()) {
+            const auto states = keyEvent.key().states();
+            if (states.test(KeyState::Ctrl) || states.test(KeyState::Alt) ||
+                states.test(KeyState::Super) || states.test(KeyState::Hyper) ||
+                states.test(KeyState::Meta)) {
+                // Shortcuts, including Ctrl+Backspace, belong to the editor.
+                resetComposition();
+                return;
+            }
         }
 
         if (EngineProcessKeyEvent(bambooEngine_.handle(),
@@ -159,15 +208,25 @@ public:
             keyEvent.filterAndAccept();
         }
 
-        if (char *commit = EnginePullCommit(bambooEngine_.handle())) {
-            if (commit[0]) {
-                ic_->commitString(commit);
-            }
-            free(commit);
-        }
-
         ic_->inputPanel().reset();
+        UniqueCPtr<char> commit(EnginePullCommit(bambooEngine_.handle()));
         UniqueCPtr<char> preedit(EnginePullPreedit(bambooEngine_.handle()));
+        if (directInput()) {
+            const std::string committed = commit ? commit.get() : "";
+            const std::string composing = preedit ? preedit.get() : "";
+            updateDirectText(committed + composing);
+            directText_ = composing;
+            if (directText_.empty()) {
+                directCursor_.reset();
+                directSurroundingHistory_.clear();
+            }
+            ic_->updatePreedit();
+            ic_->updateUserInterface(UserInterfaceComponent::InputPanel);
+            return;
+        }
+        if (commit && commit.get()[0]) {
+            ic_->commitString(commit.get());
+        }
         if (preedit && preedit.get()[0]) {
             std::string_view preeditView = preedit.get();
             Text text;
@@ -191,7 +250,18 @@ public:
         ic_->updateUserInterface(UserInterfaceComponent::InputPanel);
     }
 
-    void reset() {
+    void reset(bool immediately = false) {
+        if (waitingForCommit_ && !immediately) {
+            // Finish already accepted input before starting a fresh word.
+            pendingKeys_.emplace_back(std::nullopt);
+        } else {
+            flushPendingInput();
+            resetComposition();
+        }
+    }
+
+    void resetComposition() {
+        resetDirectTracking();
         ic_->inputPanel().reset();
         if (bambooEngine_) {
             ResetEngine(bambooEngine_.handle());
@@ -201,6 +271,11 @@ public:
     }
 
     void commitBuffer() {
+        if (directInput()) {
+            // The text is already in the document, including on focus loss.
+            reset(true);
+            return;
+        }
         ic_->inputPanel().reset();
         if (bambooEngine_) {
             // The reason that we do not commit here is we want to force the
@@ -217,10 +292,214 @@ public:
     }
 
 private:
+    void resetDirectTracking() {
+        directText_.clear();
+        directCursor_.reset();
+        directSurroundingHistory_.clear();
+        directBackspaceFallback_ = false;
+    }
+
+    void finishPendingCommit() {
+        waitingForCommit_ = false;
+        auto text = std::exchange(pendingCommit_, {});
+        if (!text.empty()) {
+            ic_->commitString(text);
+        }
+        while (!waitingForCommit_ && !pendingKeys_.empty()) {
+            auto pending = pendingKeys_.front();
+            pendingKeys_.pop_front();
+            if (!pending) {
+                resetComposition();
+                continue;
+            }
+            auto &event = *pending;
+            keyEvent(event);
+            if (!event.accepted()) {
+                ic_->forwardKey(event.rawKey(), event.isRelease(),
+                                event.time());
+                if (!event.isRelease()) {
+                    // A native Enter or cursor movement must reach the client
+                    // before we commit text from the next queued key.
+                    deferCommit({});
+                }
+            }
+        }
+    }
+
+    void flushPendingInput() {
+        while (waitingForCommit_) {
+            directCommitTimer_->setEnabled(false);
+            finishPendingCommit();
+        }
+    }
+
+    void deferCommit(std::string text) {
+        pendingCommit_ = std::move(text);
+        waitingForCommit_ = true;
+        // GNOME/Wayland and Qt deliver forwarded keys asynchronously.
+        // Sending a commit in the same turn can insert the new vowel before
+        // Backspace removes the old one (observed with Ghostty/GTK4).
+        constexpr uint64_t replacementDelay = 10000;
+        if (!directCommitTimer_) {
+            directCommitTimer_ = engine_->instance_->eventLoop().addTimeEvent(
+                CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + replacementDelay, 1000,
+                [this](EventSourceTime *, uint64_t) {
+                    finishPendingCommit();
+                    return true;
+                });
+        } else {
+            directCommitTimer_->setNextInterval(replacementDelay);
+        }
+        directCommitTimer_->setOneShot();
+    }
+
+    bool directInput() const {
+        // Backspace works on characters, not the bytes of legacy encodings or
+        // the combining marks in decomposed Unicode output.
+        return *engine_->config().directInput &&
+               *engine_->config().outputCharset == "Unicode";
+    }
+
+    bool hasSurroundingText() const {
+        return !directBackspaceFallback_ &&
+               ic_->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
+               ic_->surroundingText().isValid();
+    }
+
+    bool isZenWayland() const {
+        return ic_->frontendName() == "ibus" && ic_->program() == "zen.desktop";
+    }
+
+    bool isStaleZenSurrounding() const {
+        // Mozilla bug 2080478: native Wayland web fields may echo the state
+        // before recent commits. The address bar updates correctly.
+        // Match an exact old state so real edits still reset composition.
+        if (!isZenWayland() || directSurroundingHistory_.empty()) {
+            return false;
+        }
+        const auto &surrounding = ic_->surroundingText();
+        return surrounding.isValid() &&
+               std::any_of(
+                   directSurroundingHistory_.begin(),
+                   directSurroundingHistory_.end(),
+                   [&surrounding](const SurroundingText &previous) {
+                       return surrounding.cursor() == previous.cursor() &&
+                              surrounding.anchor() == previous.anchor() &&
+                              surrounding.text() == previous.text();
+                   });
+    }
+
+    bool directTextMatches() const {
+        if (!hasSurroundingText()) {
+            // Clients without surrounding text notify cursor moves via reset.
+            return true;
+        }
+        const auto &surrounding = ic_->surroundingText();
+        if (surrounding.cursor() != surrounding.anchor() ||
+            (directCursor_ && surrounding.cursor() != *directCursor_)) {
+            return false;
+        }
+        const auto cursor = utf8::ncharByteLength(surrounding.text().begin(),
+                                                  surrounding.cursor());
+        return static_cast<size_t>(cursor) >= directText_.size() &&
+               surrounding.text().compare(cursor - directText_.size(),
+                                          directText_.size(), directText_) == 0;
+    }
+
+    void updateDirectText(const std::string &text) {
+        if (text == directText_) {
+            return;
+        }
+        // Compare whole UTF-8 characters: different Vietnamese vowels can
+        // share leading bytes, which must never become part of the prefix.
+        size_t prefix = 0;
+        while (prefix < directText_.size() && prefix < text.size()) {
+            auto oldEnd = utf8::nextChar(directText_.begin() + prefix);
+            auto newEnd = utf8::nextChar(text.begin() + prefix);
+            const size_t oldLength = oldEnd - directText_.begin() - prefix;
+            const size_t newLength = newEnd - text.begin() - prefix;
+            if (oldLength != newLength ||
+                directText_.compare(prefix, oldLength, text, prefix,
+                                    newLength) != 0) {
+                break;
+            }
+            prefix += oldLength;
+        }
+        const auto erase =
+            utf8::length(directText_, prefix, directText_.size());
+        const auto insert = text.substr(prefix);
+
+        const bool surroundingAvailable = hasSurroundingText();
+        std::string expectedText;
+        unsigned int expectedCursor = 0;
+        if (surroundingAvailable) {
+            const auto &surrounding = ic_->surroundingText();
+            if (isZenWayland()) {
+                directSurroundingHistory_.push_back(surrounding);
+                // Bound the cache for long uninterrupted input strings.
+                constexpr size_t maxSurroundingHistory = 32;
+                if (directSurroundingHistory_.size() > maxSurroundingHistory) {
+                    directSurroundingHistory_.pop_front();
+                }
+            }
+            expectedText = surrounding.text();
+            const auto selectionStart =
+                std::min(surrounding.cursor(), surrounding.anchor());
+            const auto selectionEnd =
+                std::max(surrounding.cursor(), surrounding.anchor());
+            expectedCursor = selectionStart - erase;
+            const auto begin =
+                utf8::ncharByteLength(expectedText.begin(), expectedCursor);
+            const auto end =
+                utf8::ncharByteLength(expectedText.begin(), selectionEnd);
+            expectedText.replace(begin, end - begin, insert);
+            expectedCursor += utf8::length(insert);
+        }
+
+        if (erase) {
+            if (surroundingAvailable) {
+                ic_->deleteSurroundingText(-static_cast<int>(erase), erase);
+            } else {
+                const Key backspace(FcitxKey_BackSpace, KeyStates(),
+                                    BackspaceKeyCode);
+                for (size_t i = 0; i < erase; i++) {
+                    ic_->forwardKey(backspace);
+                    ic_->forwardKey(backspace, true);
+                }
+            }
+        }
+        const auto frontend = ic_->frontendName();
+        if (erase && !surroundingAvailable &&
+            (frontend == "ibus" || frontend == "dbus")) {
+            deferCommit(insert);
+        } else if (!insert.empty()) {
+            ic_->commitString(insert);
+        }
+
+        if (surroundingAvailable) {
+            // Keep the cache current while the client processes our requests.
+            ic_->surroundingText().setText(expectedText, expectedCursor,
+                                           expectedCursor);
+            directCursor_ = expectedCursor;
+        } else {
+            directCursor_.reset();
+        }
+    }
+
     BambooEngine *engine_;
     InputContext *ic_;
     CGoObject bambooEngine_;
+    std::string directText_;
+    std::optional<unsigned int> directCursor_;
+    std::deque<SurroundingText> directSurroundingHistory_;
+    bool directBackspaceFallback_ = false;
+    std::deque<std::optional<KeyEvent>> pendingKeys_;
+    std::string pendingCommit_;
+    bool waitingForCommit_ = false;
+    std::unique_ptr<EventSourceTime> directCommitTimer_;
 };
+
+BambooEngine::~BambooEngine() = default;
 
 BambooEngine::BambooEngine(Instance *instance)
     : instance_(instance), factory_([this](InputContext &ic) {
@@ -395,8 +674,9 @@ std::string BambooEngine::subMode(const fcitx::InputMethodEntry & /*entry*/,
     return *config_.inputMethod;
 }
 
-std::string BambooEngine::subModeLabelImpl(const fcitx::InputMethodEntry & /*entry*/,
-                                           fcitx::InputContext & /*inputContext*/) {
+std::string
+BambooEngine::subModeLabelImpl(const fcitx::InputMethodEntry & /*entry*/,
+                               fcitx::InputContext & /*inputContext*/) {
     return "vi";
 }
 
@@ -424,7 +704,7 @@ void BambooEngine::deactivate(const InputMethodEntry &entry,
     if (event.type() != EventType::InputContextFocusOut) {
         state->commitBuffer();
     } else {
-        state->reset();
+        state->reset(true);
     }
 }
 

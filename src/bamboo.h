@@ -69,6 +69,7 @@ class BambooState;
 class BambooEngine final : public InputMethodEngineV2 {
 public:
     BambooEngine(Instance *instance);
+    ~BambooEngine() override;
 
     void activate(const InputMethodEntry &entry,
                   InputContextEvent &event) override;
@@ -112,6 +113,7 @@ public:
     void populateConfig();
 
 private:
+    friend class BambooState;
     Instance *instance_;
     BambooConfig config_;
     BambooCustomKeymap customKeymap_;

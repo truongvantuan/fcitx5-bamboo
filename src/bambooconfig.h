@@ -127,6 +127,9 @@ FCITX_CONFIGURATION(
                              _("Allow type with more freedom"), true};
     Option<bool> displayUnderline{this, "DisplayUnderline",
                                   _("Underline the preedit text"), true};
+    Option<bool> directInput{this, "DirectInput",
+                             _("Type directly into the application (Unicode)"),
+                             false};
     SubConfigOption custumKeymap{this, "CustomKeymap", _("Custom Keymap"),
                                  "fcitx://config/addon/bamboo/custom_keymap"};);
 } // namespace fcitx

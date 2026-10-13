@@ -12,3 +12,24 @@ $ mkdir build && cd build
 $ cmake -DCMAKE_INSTALL_PREFIX=[prefix to fcitx5] ..
 $ make
 # make install
+
+For typing without inline composition underlines or a preedit popup, enable
+"Type directly into the application (Unicode)" in Bamboo's configuration.
+This mode inserts each character immediately and replaces only the changed
+suffix when you type accent keys. It requires the Unicode output charset.
+Apps that support surrounding text use text replacement; other apps receive
+Backspace events before the replacement text. Compatibility in the latter
+case depends on the app processing forwarded keys in order and notifying the
+input method when the cursor moves. Turn this option off to use composition
+mode in an app that does not handle direct typing correctly.
+Zen through GNOME's IBus bridge uses Backspace replacement when a web field
+reports stale surrounding text. Its address bar retains normal text replacement.
+Moving focus to another field resets this fallback.
+
+For Telegram Desktop's Flatpak build, use its Fcitx Qt plugin with synchronous
+key processing. Apply this application-specific override and restart Telegram:
+$ flatpak override --user --env=QT_IM_MODULE=fcitx --env=QT_IM_MODULES=fcitx --env=FCITX_QT_USE_SYNC=1 org.telegram.desktop
+For a native Qt build, launch it with the same environment variables.
+
+To run the direct-input regression tests after building:
+$ ctest --test-dir build --output-on-failure

@@ -99,6 +99,9 @@ msgstr "Kiểm tra chính tả"
 msgid "Underline the preedit text"
 msgstr "Gạch chân từ đang viết"
 
+msgid "Type directly into the application (Unicode)"
+msgstr "Gõ trực tiếp vào ứng dụng (Unicode)"
+
 #: src/bambooconfig.h:119
 msgid "Use oà, _uý (instead of òa, úy)"
 msgstr "Sử dụng oà, _uý (thay vì òa, úy)"

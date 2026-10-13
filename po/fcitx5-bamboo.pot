@@ -95,6 +95,10 @@ msgstr ""
 msgid "Underline the preedit text"
 msgstr ""
 
+#: src/bambooconfig.h:132
+msgid "Type directly into the application (Unicode)"
+msgstr ""
+
 #: src/bambooconfig.h:119
 msgid "Use oà, _uý (instead of òa, úy)"
 msgstr ""

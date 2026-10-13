@@ -8,6 +8,7 @@ set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake" ${C
 include(FeatureSummary)
 include(GNUInstallDirs)
 include(ECMUninstallTarget)
+include(CTest)
 
 find_package(Fcitx5Core ${REQUIRED_FCITX_VERSION} REQUIRED)
 find_package(Fcitx5Module REQUIRED COMPONENTS TestFrontend)
@@ -22,6 +23,9 @@ add_subdirectory(po)
 add_subdirectory(bamboo)
 add_subdirectory(src)
 add_subdirectory(data)
+if(BUILD_TESTING)
+    add_subdirectory(test)
+endif()
 
 fcitx5_translate_desktop_file(org.fcitx.Fcitx5.Addon.Bamboo.metainfo.xml.in
     org.fcitx.Fcitx5.Addon.Bamboo.metainfo.xml XML)
