@@ -21,13 +21,18 @@ import (
 			bool modernStyle;
 			bool freeMarking;
 		} FcitxBambooEngineOption;
+		typedef struct {
+			bool accepted;
+			char *commit;
+			char *preedit;
+		} FcitxBambooEngineOutput;
 	*/
 	"C"
 	"bamboo-core"
-	"runtime/cgo"
-	"unsafe"
 	"os/signal"
+	"runtime/cgo"
 	"syscall"
+	"unsafe"
 )
 import (
 	"bufio"
@@ -49,6 +54,28 @@ func EngineProcessKeyEvent(engine uintptr, keyVal, state uint32) bool {
 	return bambooEngine.preeditProcessKeyEvent(keyVal, state)
 }
 
+// Process and collect output in one CGo call. Empty output needs no C allocation;
+// the caller owns and frees each non-nil string with free().
+//
+//export EngineProcessKeyEventWithOutput
+func EngineProcessKeyEventWithOutput(engine uintptr, keyVal, state uint32) C.FcitxBambooEngineOutput {
+	bambooEngine, ok := cgo.Handle(engine).Value().(*FcitxBambooEngine)
+	if !ok {
+		return C.FcitxBambooEngineOutput{}
+	}
+	output := C.FcitxBambooEngineOutput{
+		accepted: C.bool(bambooEngine.preeditProcessKeyEvent(keyVal, state)),
+	}
+	if bambooEngine.commitText != "" {
+		output.commit = C.CString(bambooEngine.commitText)
+		bambooEngine.commitText = ""
+	}
+	if bambooEngine.preeditText != "" {
+		output.preedit = C.CString(bambooEngine.preeditText)
+	}
+	return output
+}
+
 //export EngineSetRestoreKeyStroke
 func EngineSetRestoreKeyStroke(engine uintptr) {
 	bambooEngine, ok := cgo.Handle(engine).Value().(*FcitxBambooEngine)
@@ -57,7 +84,6 @@ func EngineSetRestoreKeyStroke(engine uintptr) {
 	}
 	bambooEngine.shouldRestoreKeyStrokes = true
 }
-
 
 //export EnginePullPreedit
 func EnginePullPreedit(engine uintptr) *C.char {

@@ -33,3 +33,10 @@ For a native Qt build, launch it with the same environment variables.
 
 To run the direct-input regression tests after building:
 $ ctest --test-dir build --output-on-failure
+
+To build the optional direct-input CPU and memory benchmark:
+$ cmake -S . -B build-perf -DCMAKE_BUILD_TYPE=Release -DBAMBOO_BUILD_BENCHMARKS=ON
+$ cmake --build build-perf
+$ build-perf/test/benchmarkdirectinput
+This benchmark exercises the engine with small and large text fields. It does
+not measure application rendering or asynchronous key delivery.

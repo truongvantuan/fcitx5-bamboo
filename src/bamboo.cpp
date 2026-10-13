@@ -7,6 +7,7 @@
 
 #include "bamboo.h"
 #include "bambooconfig.h"
+#include "surroundinghistory.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -101,12 +102,12 @@ std::vector<std::string> convertToStringList(char **array) {
 
 class BambooState final : public InputContextProperty {
 public:
-    BambooState(BambooEngine *engine, InputContext *ic)
-        : engine_(engine), ic_(ic) {
+    BambooState(BambooEngine *engine, InputContext *ic, EventLoop &eventLoop)
+        : engine_(engine), ic_(ic), eventLoop_(eventLoop) {
         setEngine();
     }
 
-    ~BambooState() {}
+    ~BambooState() override = default;
 
     void setEngine() {
         flushPendingInput();
@@ -170,13 +171,15 @@ public:
             return;
         }
 
-        if (directInput() && !directText_.empty() && !directTextMatches()) {
+        std::optional<size_t> cursorByte;
+        if (directInput() && !directText_.empty() &&
+            !directTextMatches(cursorByte)) {
             if (isStaleZenSurrounding()) {
                 // Keep the word when Zen echoes a state before our recent
                 // commits. Only this field needs the native-key fallback.
                 directBackspaceFallback_ = true;
                 directCursor_.reset();
-                directSurroundingHistory_.clear();
+                directSurroundingHistory_.reset();
             } else {
                 // The application moved the cursor, selected text, or edited
                 // the word. Never replace text outside our current buffer.
@@ -202,20 +205,29 @@ public:
             }
         }
 
-        if (EngineProcessKeyEvent(bambooEngine_.handle(),
-                                  keyEvent.rawKey().sym(),
-                                  keyEvent.rawKey().states())) {
+        const auto output = EngineProcessKeyEventWithOutput(
+            bambooEngine_.handle(), keyEvent.rawKey().sym(),
+            keyEvent.rawKey().states());
+        UniqueCPtr<char> commit(output.commit);
+        UniqueCPtr<char> preedit(output.preedit);
+        if (output.accepted) {
             keyEvent.filterAndAccept();
         }
 
         ic_->inputPanel().reset();
-        UniqueCPtr<char> commit(EnginePullCommit(bambooEngine_.handle()));
-        UniqueCPtr<char> preedit(EnginePullPreedit(bambooEngine_.handle()));
         if (directInput()) {
-            const std::string committed = commit ? commit.get() : "";
-            const std::string composing = preedit ? preedit.get() : "";
-            updateDirectText(committed + composing);
-            directText_ = composing;
+            const std::string_view committed = commit ? commit.get() : "";
+            const std::string_view composing = preedit ? preedit.get() : "";
+            if (committed.empty()) {
+                updateDirectText(composing, cursorByte);
+            } else {
+                std::string text;
+                text.reserve(committed.size() + composing.size());
+                text.append(committed);
+                text.append(composing);
+                updateDirectText(text, cursorByte);
+            }
+            directText_.assign(composing);
             if (directText_.empty()) {
                 directCursor_.reset();
                 directSurroundingHistory_.clear();
@@ -295,7 +307,7 @@ private:
     void resetDirectTracking() {
         directText_.clear();
         directCursor_.reset();
-        directSurroundingHistory_.clear();
+        directSurroundingHistory_.reset();
         directBackspaceFallback_ = false;
     }
 
@@ -341,7 +353,7 @@ private:
         // Backspace removes the old one (observed with Ghostty/GTK4).
         constexpr uint64_t replacementDelay = 10000;
         if (!directCommitTimer_) {
-            directCommitTimer_ = engine_->instance_->eventLoop().addTimeEvent(
+            directCommitTimer_ = eventLoop_.addTimeEvent(
                 CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + replacementDelay, 1000,
                 [this](EventSourceTime *, uint64_t) {
                     finishPendingCommit();
@@ -377,19 +389,10 @@ private:
         if (!isZenWayland() || directSurroundingHistory_.empty()) {
             return false;
         }
-        const auto &surrounding = ic_->surroundingText();
-        return surrounding.isValid() &&
-               std::any_of(
-                   directSurroundingHistory_.begin(),
-                   directSurroundingHistory_.end(),
-                   [&surrounding](const SurroundingText &previous) {
-                       return surrounding.cursor() == previous.cursor() &&
-                              surrounding.anchor() == previous.anchor() &&
-                              surrounding.text() == previous.text();
-                   });
+        return directSurroundingHistory_.matches(ic_->surroundingText());
     }
 
-    bool directTextMatches() const {
+    bool directTextMatches(std::optional<size_t> &cursorByte) const {
         if (!hasSurroundingText()) {
             // Clients without surrounding text notify cursor moves via reset.
             return true;
@@ -401,57 +404,60 @@ private:
         }
         const auto cursor = utf8::ncharByteLength(surrounding.text().begin(),
                                                   surrounding.cursor());
+        cursorByte = cursor;
         return static_cast<size_t>(cursor) >= directText_.size() &&
                surrounding.text().compare(cursor - directText_.size(),
                                           directText_.size(), directText_) == 0;
     }
 
-    void updateDirectText(const std::string &text) {
+    void updateDirectText(std::string_view text,
+                          std::optional<size_t> cursorByte) {
         if (text == directText_) {
             return;
         }
-        // Compare whole UTF-8 characters: different Vietnamese vowels can
-        // share leading bytes, which must never become part of the prefix.
+        // Find the common bytes, then rewind a partial UTF-8 character.
+        // Vietnamese vowels often share leading bytes; never keep those alone.
+        const auto commonLength = std::min(directText_.size(), text.size());
         size_t prefix = 0;
-        while (prefix < directText_.size() && prefix < text.size()) {
-            auto oldEnd = utf8::nextChar(directText_.begin() + prefix);
-            auto newEnd = utf8::nextChar(text.begin() + prefix);
-            const size_t oldLength = oldEnd - directText_.begin() - prefix;
-            const size_t newLength = newEnd - text.begin() - prefix;
-            if (oldLength != newLength ||
-                directText_.compare(prefix, oldLength, text, prefix,
-                                    newLength) != 0) {
-                break;
-            }
-            prefix += oldLength;
+        while (prefix < commonLength && directText_[prefix] == text[prefix]) {
+            ++prefix;
+        }
+        while (prefix && prefix < text.size() &&
+               (static_cast<unsigned char>(text[prefix]) & 0xc0) == 0x80) {
+            --prefix;
         }
         const auto erase =
             utf8::length(directText_, prefix, directText_.size());
-        const auto insert = text.substr(prefix);
+        const std::string insert(text.substr(prefix));
 
         const bool surroundingAvailable = hasSurroundingText();
         std::string expectedText;
         unsigned int expectedCursor = 0;
         if (surroundingAvailable) {
             const auto &surrounding = ic_->surroundingText();
-            if (isZenWayland()) {
-                directSurroundingHistory_.push_back(surrounding);
-                // Bound the cache for long uninterrupted input strings.
-                constexpr size_t maxSurroundingHistory = 32;
-                if (directSurroundingHistory_.size() > maxSurroundingHistory) {
-                    directSurroundingHistory_.pop_front();
-                }
-            }
             expectedText = surrounding.text();
             const auto selectionStart =
                 std::min(surrounding.cursor(), surrounding.anchor());
             const auto selectionEnd =
                 std::max(surrounding.cursor(), surrounding.anchor());
             expectedCursor = selectionStart - erase;
-            const auto begin =
-                utf8::ncharByteLength(expectedText.begin(), expectedCursor);
+            // Reuse this key's validated cursor position. The old suffix is
+            // already owned UTF-8 text, so its byte length gives the deletion
+            // start without rescanning the document for each endpoint.
+            const auto selectionByte =
+                cursorByte && selectionStart == surrounding.cursor()
+                    ? *cursorByte
+                    : utf8::ncharByteLength(expectedText.begin(),
+                                            selectionStart);
+            const auto begin = selectionByte - (directText_.size() - prefix);
             const auto end =
-                utf8::ncharByteLength(expectedText.begin(), selectionEnd);
+                selectionByte +
+                utf8::ncharByteLength(expectedText.begin() + selectionByte,
+                                      selectionEnd - selectionStart);
+            if (isZenWayland()) {
+                directSurroundingHistory_.remember(surrounding, begin - prefix,
+                                                   end);
+            }
             expectedText.replace(begin, end - begin, insert);
             expectedCursor += utf8::length(insert);
         }
@@ -488,10 +494,11 @@ private:
 
     BambooEngine *engine_;
     InputContext *ic_;
+    EventLoop &eventLoop_;
     CGoObject bambooEngine_;
     std::string directText_;
     std::optional<unsigned int> directCursor_;
-    std::deque<SurroundingText> directSurroundingHistory_;
+    SurroundingHistory directSurroundingHistory_;
     bool directBackspaceFallback_ = false;
     std::deque<std::optional<KeyEvent>> pendingKeys_;
     std::string pendingCommit_;
@@ -503,7 +510,7 @@ BambooEngine::~BambooEngine() = default;
 
 BambooEngine::BambooEngine(Instance *instance)
     : instance_(instance), factory_([this](InputContext &ic) {
-          return new BambooState(this, &ic);
+          return new BambooState(this, &ic, instance_->eventLoop());
       }) {
     Init();
     {

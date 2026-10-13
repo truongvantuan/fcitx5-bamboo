@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace fcitx {
@@ -34,15 +35,17 @@ class CGoObject {
 public:
     CGoObject(std::optional<uintptr_t> handle = std::nullopt)
         : handle_(handle) {}
-    ~CGoObject() {
-        if (handle_) {
-            DeleteObject(*handle_);
-        }
-    }
+    ~CGoObject() { clear(); }
     CGoObject(const CGoObject &other) = delete;
-    CGoObject(CGoObject &&other) = default;
+    CGoObject(CGoObject &&other) noexcept
+        : handle_(std::exchange(other.handle_, std::nullopt)) {}
 
-    CGoObject &operator=(CGoObject &&other) = default;
+    CGoObject &operator=(CGoObject &&other) noexcept {
+        if (this != &other) {
+            reset(std::exchange(other.handle_, std::nullopt));
+        }
+        return *this;
+    }
     CGoObject &operator=(const CGoObject &other) = delete;
 
     void reset(std::optional<uintptr_t> handle = std::nullopt) {
@@ -50,9 +53,9 @@ public:
         handle_ = handle;
     }
 
-    uintptr_t handle() { return *handle_; }
+    uintptr_t handle() const { return *handle_; }
 
-    operator bool() const { return handle_.has_value(); }
+    explicit operator bool() const { return handle_.has_value(); }
 
 private:
     void clear() {
@@ -113,7 +116,6 @@ public:
     void populateConfig();
 
 private:
-    friend class BambooState;
     Instance *instance_;
     BambooConfig config_;
     BambooCustomKeymap customKeymap_;
